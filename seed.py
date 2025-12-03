@@ -17,6 +17,7 @@ contrast = 1.2
 contour_levels = 18
 fps = 15
 duration = int(1000 / fps)
+interp_frames = 5  # Número de frames intermedios entre cada par de filas (0 = sin interpolación)
 
 def validate_csv(df):
     """Valida que el CSV tenga las columnas requeridas"""
@@ -32,6 +33,23 @@ def normalize_value(val, min_val, max_val):
     if max_val - min_val == 0:
         return 0.5
     return (val - min_val) / (max_val - min_val)
+
+def interpolate_rows(row1, row2, t):
+    """
+    Interpola entre dos filas del dataframe
+
+    Args:
+        row1: Primera fila
+        row2: Segunda fila
+        t: Factor de interpolación [0, 1], donde 0=row1 y 1=row2
+
+    Returns:
+        Serie de pandas con valores interpolados
+    """
+    interpolated = row1.copy()
+    for col in REQUIRED_COLS:
+        interpolated[col] = row1[col] * (1 - t) + row2[col] * t
+    return interpolated
 
 def generate_dynamic_topography(row, df_stats, W, H, n_hills, rng):
     """
@@ -118,42 +136,89 @@ try:
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"📂 Carpeta creada: {output_dir}")
-    print(f"📊 Generando {len(df)} mapas topográficos dinámicos...")
+
+    # Calcular total de frames con interpolación
+    total_frames = len(df) + (len(df) - 1) * interp_frames
+    print(f"📊 Generando {total_frames} mapas topográficos dinámicos...")
+    print(f"   ({len(df)} filas originales + {(len(df) - 1) * interp_frames} frames interpolados)")
 
     # --- Generar imágenes ---
     frames = []
-    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Generando imágenes"):
-        # Calcular semilla a partir de esta fila (para reproducibilidad)
-        seed_val = int(np.sum([row[c] for c in REQUIRED_COLS]) * 1e6) % (2**32 - 1)
-        rng = np.random.default_rng(seed_val)
+    frame_counter = 0
 
-        # Generar topografía dinámica basada en datos
-        z, xx, yy = generate_dynamic_topography(row, df_stats, W, H, n_hills, rng)
+    with tqdm(total=total_frames, desc="Generando imágenes") as pbar:
+        for idx in range(len(df)):
+            row = df.iloc[idx]
 
-        # Crear figura
-        fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
-        ax.set_axis_off()
-        ax.imshow(z, cmap='gray_r', origin='lower', extent=(0, 1, 0, 1), interpolation='bilinear')
-        levels = np.linspace(0, 1, contour_levels)
-        ax.contour(xx, yy, z, levels=levels, colors='black', linewidths=0.6, alpha=0.9, origin='lower')
+            # Generar frame para la fila actual
+            seed_val = int(np.sum([row[c] for c in REQUIRED_COLS]) * 1e6) % (2**32 - 1)
+            rng = np.random.default_rng(seed_val)
+            z, xx, yy = generate_dynamic_topography(row, df_stats, W, H, n_hills, rng)
 
-        # Título con información de sensores
-        title = (f'Fila {idx+1} | Alt: {row["Altitud"]:.1f}m | '
-                f'Accel: ({row["Ax"]:.2f}, {row["Ay"]:.2f}, {row["Az"]:.2f})')
-        ax.set_title(title, fontsize=7)
+            # Crear figura
+            fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
+            ax.set_axis_off()
+            ax.imshow(z, cmap='gray_r', origin='lower', extent=(0, 1, 0, 1), interpolation='bilinear')
+            levels = np.linspace(0, 1, contour_levels)
+            ax.contour(xx, yy, z, levels=levels, colors='black', linewidths=0.6, alpha=0.9, origin='lower')
 
-        # Guardar frame en archivo
-        output_file = os.path.join(output_dir, f"frame_{idx:04d}.png")
-        plt.savefig(output_file, dpi=300, bbox_inches='tight', pad_inches=0)
+            # Título con información de sensores
+            title = (f'Fila {idx+1} | Alt: {row["Altitud"]:.1f}m | '
+                    f'Accel: ({row["Ax"]:.2f}, {row["Ay"]:.2f}, {row["Az"]:.2f})')
+            ax.set_title(title, fontsize=7)
 
-        # Guardar frame en memoria para el GIF (más eficiente)
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=300, bbox_inches='tight', pad_inches=0)
-        buf.seek(0)
-        frames.append(Image.open(buf).copy())
-        buf.close()
+            # Guardar frame en archivo
+            output_file = os.path.join(output_dir, f"frame_{frame_counter:04d}.png")
+            plt.savefig(output_file, dpi=300, bbox_inches='tight', pad_inches=0)
 
-        plt.close(fig)
+            # Guardar frame en memoria para el GIF
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=300, bbox_inches='tight', pad_inches=0)
+            buf.seek(0)
+            frames.append(Image.open(buf).copy())
+            buf.close()
+            plt.close(fig)
+
+            frame_counter += 1
+            pbar.update(1)
+
+            # Generar frames interpolados hacia la siguiente fila
+            if idx < len(df) - 1 and interp_frames > 0:
+                next_row = df.iloc[idx + 1]
+
+                for i in range(1, interp_frames + 1):
+                    t = i / (interp_frames + 1)  # Factor de interpolación
+                    interp_row = interpolate_rows(row, next_row, t)
+
+                    # Generar frame interpolado
+                    seed_val = int(np.sum([interp_row[c] for c in REQUIRED_COLS]) * 1e6) % (2**32 - 1)
+                    rng = np.random.default_rng(seed_val)
+                    z, xx, yy = generate_dynamic_topography(interp_row, df_stats, W, H, n_hills, rng)
+
+                    fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
+                    ax.set_axis_off()
+                    ax.imshow(z, cmap='gray_r', origin='lower', extent=(0, 1, 0, 1), interpolation='bilinear')
+                    levels = np.linspace(0, 1, contour_levels)
+                    ax.contour(xx, yy, z, levels=levels, colors='black', linewidths=0.6, alpha=0.9, origin='lower')
+
+                    # Título para frame interpolado
+                    title = (f'Fila {idx+1}→{idx+2} ({t*100:.0f}%) | Alt: {interp_row["Altitud"]:.1f}m | '
+                            f'Accel: ({interp_row["Ax"]:.2f}, {interp_row["Ay"]:.2f}, {interp_row["Az"]:.2f})')
+                    ax.set_title(title, fontsize=7)
+
+                    # Guardar frame interpolado
+                    output_file = os.path.join(output_dir, f"frame_{frame_counter:04d}.png")
+                    plt.savefig(output_file, dpi=300, bbox_inches='tight', pad_inches=0)
+
+                    buf = io.BytesIO()
+                    plt.savefig(buf, format='png', dpi=300, bbox_inches='tight', pad_inches=0)
+                    buf.seek(0)
+                    frames.append(Image.open(buf).copy())
+                    buf.close()
+                    plt.close(fig)
+
+                    frame_counter += 1
+                    pbar.update(1)
 
     # --- Crear GIF ---
     gif_path = os.path.join(output_dir, f"animation_{date_folder}.gif")
